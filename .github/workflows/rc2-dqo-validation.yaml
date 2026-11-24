@@ -65,6 +65,7 @@ jobs:
             --set 'controllerManager.featureGates[0].enabled=true' \
             --set "controllerManager.manager.image.tag=$RC_TAG" \
             --wait --timeout 8m
+          kubectl wait --for=condition=Established --timeout=120s crd/resourceflavors.kueue.x-k8s.io crd/cohorts.kueue.x-k8s.io crd/clusterqueues.kueue.x-k8s.io crd/capacityproviders.kueue.x-k8s.io crd/dynamicquotaorchestrators.kueue.x-k8s.io
           kubectl -n kueue-system get deploy,pods -o wide
           kubectl -n kueue-system get pods -o json > rc-pods.json
           python3 - <<'PY'
@@ -83,7 +84,11 @@ jobs:
           import datetime, json, subprocess, time
 
           def k(*args, obj=None):
-              return subprocess.check_output(["kubectl", *args], input=None if obj is None else json.dumps(obj), text=True, stderr=subprocess.STDOUT)
+              cmd = ["kubectl", "--request-timeout=20s", *args]
+              result = subprocess.run(cmd, input=None if obj is None else json.dumps(obj), text=True, capture_output=True)
+              if result.returncode:
+                  raise RuntimeError(f"{cmd!r}: exit={result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}\nobject: {obj!r}")
+              return result.stdout
 
           def get(kind, name):
               return json.loads(k("get", kind, name, "-o", "json"))
@@ -142,7 +147,20 @@ jobs:
                       raise AssertionError((label, expected, actual, conditions, cond(blocked) if blocked else None))
                   time.sleep(2)
 
-          create("ResourceFlavor", "f1")
+          # The deployment being Ready is not sufficient to prove that API discovery
+          # and admission webhook certificate propagation have finished.
+          fixture = {"apiVersion": "kueue.x-k8s.io/v1beta2", "kind": "ResourceFlavor", "metadata": {"name": "f1"}, "spec": {}}
+          deadline = time.monotonic() + 120
+          while True:
+              try:
+                  k("create", "--dry-run=server", "-f", "-", obj=fixture)
+                  break
+              except RuntimeError as exc:
+                  print("ResourceFlavor readiness probe:", exc, flush=True)
+                  if time.monotonic() >= deadline:
+                      raise
+                  time.sleep(3)
+          create("ResourceFlavor", "f1", {})
           create("Cohort", "root-a", {"parentName": "implicit-org"})
           create("Cohort", "root-b", {"parentName": "implicit-org"})
           queue("qa", "root-a")
@@ -182,7 +200,9 @@ jobs:
           kubectl get nodes -o wide > evidence/nodes.txt 2>&1 || true
           kubectl get clusterqueues,cohorts,dynamicquotaorchestrators,capacityproviders -o yaml > evidence/objects.yaml 2>&1 || true
           kubectl -n kueue-system get pods -o yaml > evidence/pods.yaml 2>&1 || true
-          kubectl -n kueue-system logs -l control-plane=controller-manager --all-containers --tail=3000 > evidence/controller.log 2>&1 || true
+          kubectl -n kueue-system get deploy -o name | while read -r deployment; do kubectl -n kueue-system logs "$deployment" --all-containers --tail=3000; done > evidence/controller.log 2>&1 || true
+          kubectl get validatingwebhookconfigurations,mutatingwebhookconfigurations -o yaml > evidence/webhooks.yaml 2>&1 || true
+          kubectl -n kueue-system get svc,endpointslices -o yaml > evidence/webhook-endpoints.yaml 2>&1 || true
           kubectl get events -A > evidence/events.txt 2>&1 || true
       - uses: actions/upload-artifact@v4
         if: always()
