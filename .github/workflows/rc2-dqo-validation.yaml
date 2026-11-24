@@ -1,0 +1,191 @@
+name: Kueue RC2 regression validation
+on:
+  push:
+    branches:
+      - test/v0.21.0-rc.2-dqo-validation
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  RC_SHA: d08f589ae425d7d23ea800a03b99df54a4da2c7b
+  RC_TAG: v0.21.0-rc.2
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: d08f589ae425d7d23ea800a03b99df54a4da2c7b
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Verify release source
+        run: |
+          set -eux
+          test "$(git rev-parse HEAD)" = "$RC_SHA"
+          go version
+      - name: DQO and queue regression suites (race detector)
+        run: |
+          set -euxo pipefail
+          mkdir -p evidence
+          go test -race -p 2 ./pkg/controller/core/dqo/... ./pkg/cache/queue/... -count=1 -timeout=20m -json | tee evidence/unit.jsonl
+      - name: Repeat targeted regressions
+        run: |
+          set -euxo pipefail
+          go test -race -p 2 ./pkg/controller/core/dqo ./pkg/cache/queue -run 'Test(ClusterQueueMovedToAnotherDQOSubtree|CohortMovedToAnotherDQOSubtree|IncompleteRedistributionCondition|PreWriteDistributionErrorPreservesCondition|InadmissibleRequeue)' -count=10 -timeout=15m -json | tee evidence/repeated.jsonl
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rc2-unit-evidence
+          path: evidence/
+  live-cluster:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: d08f589ae425d7d23ea800a03b99df54a4da2c7b
+      - name: Start disposable Kubernetes cluster
+        run: |
+          set -euxo pipefail
+          test "$(git rev-parse HEAD)" = "$RC_SHA"
+          command -v kind || go install sigs.k8s.io/kind@v0.29.0
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          kind create cluster --name rc2-dqo --image kindest/node:v1.35.8 --wait 180s
+          kubectl version
+          kubectl get nodes -o wide
+      - name: Install RC chart and release image with DQO enabled
+        run: |
+          set -euxo pipefail
+          helm upgrade --install kueue ./charts/kueue -n kueue-system --create-namespace \
+            --set enableAlphaAPIs=true \
+            --set 'controllerManager.featureGates[0].name=DynamicQuotaOrchestration' \
+            --set 'controllerManager.featureGates[0].enabled=true' \
+            --set "controllerManager.manager.image.tag=$RC_TAG" \
+            --wait --timeout 8m
+          kubectl -n kueue-system get deploy,pods -o wide
+          kubectl -n kueue-system get pods -o json > rc-pods.json
+          python3 - <<'PY'
+          import json, os
+          pods = json.load(open("rc-pods.json"))["items"]
+          expected = "us-central1-docker.pkg.dev/k8s-staging-images/kueue/kueue:" + os.environ["RC_TAG"]
+          matches = [c for p in pods for c in p.get("status", {}).get("containerStatuses", []) if c["image"] == expected]
+          assert matches and all(c["ready"] and c.get("imageID") for c in matches), matches
+          print("RC image IDs:", [c["imageID"] for c in matches])
+          PY
+      - name: Verify real-cluster quota handoff and root retarget
+        run: |
+          set -euxo pipefail
+          mkdir -p evidence
+          python3 -u - <<'PY' | tee evidence/live-test.log
+          import datetime, json, subprocess, time
+
+          def k(*args, obj=None):
+              return subprocess.check_output(["kubectl", *args], input=None if obj is None else json.dumps(obj), text=True, stderr=subprocess.STDOUT)
+
+          def get(kind, name):
+              return json.loads(k("get", kind, name, "-o", "json"))
+
+          def create(kind, name, spec=None, alpha=False):
+              obj = {"apiVersion": "kueue.x-k8s.io/" + ("v1alpha1" if alpha else "v1beta2"), "kind": kind, "metadata": {"name": name}}
+              if spec is not None:
+                  obj["spec"] = spec
+              print(k("create", "-f", "-", obj=obj).strip())
+
+          def patch(kind, name, data, status=False):
+              args = ["patch", kind, name, "--type=merge", "-p", json.dumps(data)]
+              if status:
+                  args += ["--subresource=status"]
+              print(k(*args).strip())
+
+          def provider(name, cpu):
+              create("CapacityProvider", name, {"controllerName": "example.com/rc-validation", "orchestratedFlavors": [{"name": "f1"}]}, True)
+              capacity(name, cpu)
+
+          def capacity(name, cpu):
+              generation = get("capacityprovider", name)["metadata"]["generation"]
+              now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+              patch("capacityprovider", name, {"status": {"capacity": {"flavors": [{"name": "f1", "resources": {"cpu": str(cpu)}}]}, "conditions": [{"type": "CapacitySynchronized", "status": "True", "reason": "Synchronized", "message": "Controlled release validation fixture", "observedGeneration": generation, "lastTransitionTime": now}]}}, True)
+
+          def queue(name, root):
+              create("ClusterQueue", name, {"cohortName": root, "namespaceSelector": {}, "resourceGroups": [{"coveredResources": ["cpu"], "flavors": [{"name": "f1", "resources": [{"name": "cpu", "nominalQuota": "10"}]}]}]})
+
+          def dqo(name, cp, kind, root):
+              create("DynamicQuotaOrchestrator", name, {"capacityDiscovery": {"providers": [{"name": cp}]}, "capacityDistribution": {"subtreeRootQuotaRef": {"kind": kind, "name": root}}}, True)
+
+          def cond(name):
+              obj = get("dynamicquotaorchestrator", name)
+              return next((c for c in obj.get("status", {}).get("conditions", []) if c["type"] == "Distributed"), {})
+
+          def actual_queue(name):
+              eq = get("clusterqueue", name).get("status", {}).get("effectiveQuotas") or {}
+              resources = [r for rg in eq.get("resourceGroups", []) for f in rg["flavors"] if f["name"] == "f1" for r in f["resources"] if r["name"] == "cpu"]
+              return (eq.get("orchestratorRef", {}).get("name"), str(resources[0]["nominalQuota"]) if resources else None)
+
+          def eventually(label, expected, dqos, blocked=None):
+              deadline = time.monotonic() + 120
+              stable = 0
+              while True:
+                  actual = {name: actual_queue(name) for name in expected}
+                  conditions = {name: cond(name) for name in dqos}
+                  good = actual == expected and all(c.get("status") == "True" and c.get("reason") == "QuotasDistributed" for c in conditions.values())
+                  if blocked:
+                      c = cond(blocked)
+                      good = good and c.get("status") == "False" and c.get("reason") == "ConflictingDynamicQuotaOrchestrator"
+                  stable = stable + 1 if good else 0
+                  if stable >= 3:
+                      print("PASS:", label, json.dumps({"queues": actual, "conditions": conditions}, sort_keys=True))
+                      return
+                  if time.monotonic() > deadline:
+                      raise AssertionError((label, expected, actual, conditions, cond(blocked) if blocked else None))
+                  time.sleep(2)
+
+          create("ResourceFlavor", "f1")
+          create("Cohort", "root-a", {"parentName": "implicit-org"})
+          create("Cohort", "root-b", {"parentName": "implicit-org"})
+          queue("qa", "root-a")
+          queue("moved", "root-a")
+          queue("qb", "root-b")
+          provider("cp-a", 100)
+          provider("cp-b", 100)
+          dqo("dqo-a", "cp-a", "Cohort", "root-a")
+          dqo("dqo-b", "cp-b", "Cohort", "root-b")
+          both = ["dqo-a", "dqo-b"]
+          eventually("initial distribution", {"qa": ("dqo-a", "50"), "moved": ("dqo-a", "50"), "qb": ("dqo-b", "100")}, both)
+          patch("clusterqueue", "moved", {"spec": {"cohortName": "root-b"}})
+          eventually("queue move A to B", {"qa": ("dqo-a", "100"), "moved": ("dqo-b", "50"), "qb": ("dqo-b", "50")}, both)
+          capacity("cp-b", 40)
+          eventually("destination capacity shrink", {"qa": ("dqo-a", "100"), "moved": ("dqo-b", "20"), "qb": ("dqo-b", "20")}, both)
+          patch("clusterqueue", "moved", {"spec": {"cohortName": "root-a"}})
+          eventually("queue move B to A", {"qa": ("dqo-a", "50"), "moved": ("dqo-a", "50"), "qb": ("dqo-b", "40")}, both)
+
+          create("Cohort", "root-c", {})
+          create("Cohort", "root-d", {})
+          queue("qc", "root-c")
+          queue("qd", "root-d")
+          provider("cp-c", 100)
+          provider("cp-d", 40)
+          dqo("owner-c", "cp-c", "Cohort", "root-c")
+          eventually("initial root ownership", {"qc": ("owner-c", "100")}, ["owner-c"])
+          dqo("owner-d", "cp-d", "ClusterQueue", "qc")
+          eventually("overlapping destination blocked", {"qc": ("owner-c", "100")}, ["owner-c"], "owner-d")
+          patch("dynamicquotaorchestrator", "owner-c", {"spec": {"capacityDistribution": {"subtreeRootQuotaRef": {"kind": "Cohort", "name": "root-d"}}}})
+          eventually("root retarget wakes destination without extra events", {"qc": ("owner-d", "40"), "qd": ("owner-c", "100")}, ["owner-c", "owner-d"])
+          PY
+      - name: Collect evidence
+        if: always()
+        run: |
+          mkdir -p evidence
+          cp rc-pods.json evidence/ 2>/dev/null || true
+          kubectl get nodes -o wide > evidence/nodes.txt 2>&1 || true
+          kubectl get clusterqueues,cohorts,dynamicquotaorchestrators,capacityproviders -o yaml > evidence/objects.yaml 2>&1 || true
+          kubectl -n kueue-system get pods -o yaml > evidence/pods.yaml 2>&1 || true
+          kubectl -n kueue-system logs -l control-plane=controller-manager --all-containers --tail=3000 > evidence/controller.log 2>&1 || true
+          kubectl get events -A > evidence/events.txt 2>&1 || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rc2-live-cluster-evidence
+          path: evidence/
